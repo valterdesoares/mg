@@ -31,23 +31,283 @@ type
   OpcaoLista :TOpcaoParaLista;
 
   private
+    FCodEmp: Integer;
     FParametro2: string;
-    FParametroItems: TStrings;
-//    CONST iEmp :Integer = 1;
+    function IsLista: Boolean;
     procedure SetParametro2(const Value: string);
-    procedure InserirParametroNoBanco;
+    function GetParametro2:string;
+    class function ResolveCodEmp(const ACodEmp: Integer = -1): Integer; static;
+    class function DefaultCodEmp: Integer; static;
   public
 
     constructor Create(AArgumento :string = '';
                        ASubArgumento :string = '';
                        AParametroAdicional :string  = '';
-                       AdescrParametro :string = '');overload;
+                       AdescrParametro :string = '';
+                       ACodEmp: Integer = -1);overload;
     destructor Destroy(); override;
-    function GetParametro2:string;
     property Parametro2 :string read GetParametro2 write SetParametro2;
     class function RetornaParametro(FArgumento, FSubArgumento:string): string;
     class function RetornaParametroDef(FArgumento, FSubArgumento, FDefault:string): string;
   end;
+
+{ TParametrosRepository }
+
+class constructor TParametrosRepository.Create;
+begin
+  FCache := TDictionary<string, TParametroRegistro>.Create;
+  FListaCache := TDictionary<string, string>.Create;
+  FLock := TObject.Create;
+end;
+
+class destructor TParametrosRepository.Destroy;
+begin
+  FCache.Free;
+  FListaCache.Free;
+  FLock.Free;
+end;
+
+class function TParametrosRepository.CacheKey(const ACodEmp: Integer;
+  const AArgumento, ASubArgumento: string): string;
+begin
+  Result := IntToStr(ACodEmp) + '|' + UpperCase(AArgumento) + '|' + UpperCase(ASubArgumento);
+end;
+
+class function TParametrosRepository.CacheKeyPrefix(const ACodEmp: Integer;
+  const AArgumento: string): string;
+begin
+  Result := IntToStr(ACodEmp) + '|' + UpperCase(AArgumento) + '|';
+end;
+
+class function TParametrosRepository.ListaKey(const ACodEmp: Integer;
+  const AArgumento: string): string;
+begin
+  Result := IntToStr(ACodEmp) + '|' + UpperCase(AArgumento);
+end;
+
+class function TParametrosRepository.AcquireRegistroLocked(
+  const ACodEmp: Integer; const AArgumento, ASubArgumento: string;
+  out ARegistro: TParametroRegistro): Boolean;
+begin
+  FillChar(ARegistro, SizeOf(ARegistro), 0);
+  with DM.QParametros2 do
+  begin
+    Close;
+    SQL.Clear;
+    SQL.Add('select Trim(A.PARAMETRO) as PARAMETRO,');
+    SQL.Add('       Trim(coalesce(A.PARAMETRO2, '''')) as PARAMETRO2,');
+    SQL.Add('       Trim(coalesce(A.DESCRPAR, '''')) as DESCRPAR');
+    SQL.Add('  from PARAMETROS2 A');
+    SQL.Add(' where (A.COD_EMP = :COD_EMP)');
+    SQL.Add('   and (A.ARGUMENTO = :ARGUMENTO)');
+    SQL.Add('   and (A.SUBARGUM = :SUBARGUM)');
+    ParamByName('COD_EMP').AsInteger := ACodEmp;
+    ParamByName('ARGUMENTO').AsString := AArgumento;
+    ParamByName('SUBARGUM').AsString := ASubArgumento;
+    Open;
+    try
+      Result := not IsEmpty;
+      if Result then
+      begin
+        ARegistro.Valor := Trim(Fields[0].AsString);
+        ARegistro.ParametroAdicional := Trim(Fields[1].AsString);
+        ARegistro.Descricao := Trim(Fields[2].AsString);
+      end
+      else
+      begin
+        ARegistro.Valor := '';
+        ARegistro.ParametroAdicional := '';
+        ARegistro.Descricao := '';
+      end;
+    finally
+      Close;
+    end;
+  end;
+end;
+
+class function TParametrosRepository.AcquireListaLocked(
+  const ACodEmp: Integer; const AArgumento: string; out AValor: string): Boolean;
+var
+  LItens: TStringList;
+begin
+  with DM.QParametros2 do
+  begin
+    Close;
+    SQL.Clear;
+    SQL.Add('select Trim(A.PARAMETRO) as PARAMETRO');
+    SQL.Add('  from PARAMETROS2 A');
+    SQL.Add(' where (A.COD_EMP = :COD_EMP)');
+    SQL.Add('   and (A.ARGUMENTO = :ARGUMENTO)');
+    SQL.Add(' order by A.SUBARGUM');
+    ParamByName('COD_EMP').AsInteger := ACodEmp;
+    ParamByName('ARGUMENTO').AsString := AArgumento;
+    Open;
+    LItens := TStringList.Create;
+    try
+      while not Eof do
+      begin
+        LItens.Add(Trim(Fields[0].AsString));
+        Next;
+      end;
+      Result := LItens.Count > 0;
+      AValor := LItens.Text;
+    finally
+      LItens.Free;
+      Close;
+    end;
+  end;
+end;
+
+class procedure TParametrosRepository.StoreRegistroLocked(
+  const ACodEmp: Integer; const AArgumento, ASubArgumento, AValor,
+  AAdicional, ADescricao: string);
+begin
+  with DM.QInsParam2 do
+  begin
+    Close;
+    SQL.Clear;
+    SQL.Add('update or insert into PARAMETROS2 (COD_EMP, ARGUMENTO, SUBARGUM, PARAMETRO, DESCRPAR, PARAMETRO2) ');
+    SQL.Add('values (:COD_EMP, :ARGUMENTO, :SUBARGUM, :PARAMETRO, :DESCRPAR, :PARAMETRO2) ');
+    SQL.Add('matching (COD_EMP, ARGUMENTO, SUBARGUM) ');
+    ParamByName('COD_EMP').AsInteger := ACodEmp;
+    ParamByName('ARGUMENTO').AsString := AArgumento;
+    ParamByName('SUBARGUM').AsString := ASubArgumento;
+    ParamByName('PARAMETRO').AsString := AValor;
+    ParamByName('PARAMETRO2').AsString := AAdicional;
+    ParamByName('DESCRPAR').AsString := ADescricao;
+    try
+      ExecSQL;
+    except
+      on E: Exception do
+        raise Exception.Create('Erro ao inserir parametro' + sLineBreak +
+                               'Argumento: ' + AArgumento + sLineBreak +
+                               'SubArgumento: ' + ASubArgumento + sLineBreak +
+                               'Parametro: ' + AValor + sLineBreak +
+                               E.Message);
+    end;
+  end;
+end;
+
+class procedure TParametrosRepository.RemoveArgumentCachesLocked(
+  const ACodEmp: Integer; const AArgumento: string);
+var
+  LPrefix: string;
+  LKey: string;
+  LKeys: TArray<string>;
+begin
+  LPrefix := CacheKeyPrefix(ACodEmp, AArgumento);
+  LKeys := FCache.Keys.ToArray;
+  for LKey in LKeys do
+    if Pos(LPrefix, LKey) = 1 then
+      FCache.Remove(LKey);
+  FListaCache.Remove(ListaKey(ACodEmp, AArgumento));
+end;
+
+class function TParametrosRepository.ObterValor(const ACodEmp: Integer;
+  const AArgumento, ASubArgumento: string; out AAdicional: string): string;
+var
+  LRegistro: TParametroRegistro;
+  LKey: string;
+begin
+  LKey := CacheKey(ACodEmp, AArgumento, ASubArgumento);
+  TMonitor.Enter(FLock);
+  try
+    if not FCache.TryGetValue(LKey, LRegistro) then
+    begin
+      AcquireRegistroLocked(ACodEmp, AArgumento, ASubArgumento, LRegistro);
+      FCache.AddOrSetValue(LKey, LRegistro);
+    end;
+  finally
+    TMonitor.Exit(FLock);
+  end;
+  AAdicional := LRegistro.ParametroAdicional;
+  Result := LRegistro.Valor;
+end;
+
+class function TParametrosRepository.ObterLista(const ACodEmp: Integer;
+  const AArgumento: string; AAdicionarTodos: Boolean): string;
+var
+  LKey: string;
+  LBase: string;
+  LItens: TStringList;
+begin
+  LKey := ListaKey(ACodEmp, AArgumento);
+  TMonitor.Enter(FLock);
+  try
+    if not FListaCache.TryGetValue(LKey, LBase) then
+    begin
+      if not AcquireListaLocked(ACodEmp, AArgumento, LBase) then
+        LBase := '';
+      FListaCache.AddOrSetValue(LKey, LBase);
+    end;
+  finally
+    TMonitor.Exit(FLock);
+  end;
+
+  if AAdicionarTodos then
+  begin
+    LItens := TStringList.Create;
+    try
+      LItens.Text := LBase;
+      LItens.Insert(0, 'TODOS');
+      Result := LItens.Text;
+    finally
+      LItens.Free;
+    end;
+  end
+  else
+    Result := LBase;
+end;
+
+class procedure TParametrosRepository.GravarValor(const ACodEmp: Integer;
+  const AArgumento, ASubArgumento, AValor, AAdicional, ADescricao: string);
+var
+  LRegistro: TParametroRegistro;
+  LKey: string;
+begin
+  LKey := CacheKey(ACodEmp, AArgumento, ASubArgumento);
+  TMonitor.Enter(FLock);
+  try
+    AcquireRegistroLocked(ACodEmp, AArgumento, ASubArgumento, LRegistro);
+    if (LRegistro.Valor = AValor) and
+       (LRegistro.ParametroAdicional = AAdicional) and
+       (LRegistro.Descricao = ADescricao) then
+      Exit;
+
+    StoreRegistroLocked(ACodEmp, AArgumento, ASubArgumento, AValor, AAdicional, ADescricao);
+
+    LRegistro.Valor := AValor;
+    LRegistro.ParametroAdicional := AAdicional;
+    LRegistro.Descricao := ADescricao;
+    FCache.AddOrSetValue(LKey, LRegistro);
+    FListaCache.Remove(ListaKey(ACodEmp, AArgumento));
+  finally
+    TMonitor.Exit(FLock);
+  end;
+end;
+
+class procedure TParametrosRepository.GravarLista(const ACodEmp: Integer;
+  const AArgumento: string; const AValores: TStrings);
+var
+  I: Integer;
+begin
+  TMonitor.Enter(FLock);
+  try
+    DM.ExecutaSQL('DELETE FROM PARAMETROS2 WHERE COD_EMP = ' + IntToStr(ACodEmp) +
+      ' AND ARGUMENTO = ' + QuotedStr(AArgumento));
+
+    for I := 0 to AValores.Count - 1 do
+      StoreRegistroLocked(ACodEmp, AArgumento, IntToStr(I), AValores[I], '', '');
+
+    RemoveArgumentCachesLocked(ACodEmp, AArgumento);
+    if AValores.Count > 0 then
+      FListaCache.AddOrSetValue(ListaKey(ACodEmp, AArgumento), AValores.Text)
+    else
+      FListaCache.Remove(ListaKey(ACodEmp, AArgumento));
+  finally
+    TMonitor.Exit(FLock);
+  end;
+end;
 
 type TParametros_Factory = class(TInterfacedObject, iParametros_Factory)
   private
@@ -178,40 +438,65 @@ type
 
 implementation
 
-uses UDM;
+uses
+  System.Generics.Collections,
+  System.SyncObjs,
+  UDM;
+
+type
+  TParametroRegistro = record
+    Valor: string;
+    ParametroAdicional: string;
+    Descricao: string;
+  end;
+
+  TParametrosRepository = class sealed
+  strict private
+    class var FCache: TDictionary<string, TParametroRegistro>;
+    class var FListaCache: TDictionary<string, string>;
+    class var FLock: TObject;
+    class constructor Create;
+    class destructor Destroy;
+    class function CacheKey(const ACodEmp: Integer; const AArgumento, ASubArgumento: string): string; static;
+    class function CacheKeyPrefix(const ACodEmp: Integer; const AArgumento: string): string; static;
+    class function ListaKey(const ACodEmp: Integer; const AArgumento: string): string; static;
+    class function AcquireRegistroLocked(const ACodEmp: Integer; const AArgumento, ASubArgumento: string; out ARegistro: TParametroRegistro): Boolean; static;
+    class function AcquireListaLocked(const ACodEmp: Integer; const AArgumento: string; out AValor: string): Boolean; static;
+    class procedure StoreRegistroLocked(const ACodEmp: Integer; const AArgumento, ASubArgumento, AValor, AAdicional, ADescricao: string); static;
+    class procedure RemoveArgumentCachesLocked(const ACodEmp: Integer; const AArgumento: string); static;
+  public
+    class function ObterValor(const ACodEmp: Integer; const AArgumento, ASubArgumento: string; out AAdicional: string): string; static;
+    class function ObterLista(const ACodEmp: Integer; const AArgumento: string; AAdicionarTodos: Boolean): string; static;
+    class procedure GravarValor(const ACodEmp: Integer; const AArgumento, ASubArgumento, AValor, AAdicional, ADescricao: string); static;
+    class procedure GravarLista(const ACodEmp: Integer; const AArgumento: string; const AValores: TStrings); static;
+  end;
 
 function RetornaParam2(aArgumento :string; aSubArgumento :String; aDefault:string = ''): string;
+var
+  LAdicional: string;
 begin
- Result := Trim(TParametros2.RetornaParametroDef(aArgumento, aSubArgumento, aDefault));
+  Result := Trim(TParametrosRepository.ObterValor(TParametros2.DefaultCodEmp, aArgumento, aSubArgumento, LAdicional));
+  if (Result = '') and (aDefault <> '') then
+    Result := aDefault;
 end;
 
 function RetornaParam2EmpZero(aArgumento :string; aSubArgumento :String; aDefault:string): string;
+var
+  LAdicional: string;
 begin
-  Result := DM.RetornaStringTabela(
-               'select Trim(A.PARAMETRO) ' +
-               'from PARAMETROS2 A ' +
-               'where (A.COD_EMP = :COD_EMP) ' +
-               'and (A.ARGUMENTO = :ARGUMENTO) ' +
-               'and (A.SUBARGUM = :SUBARGUM) ',
-               [0, aArgumento, aSubArgumento],
-               [ftInteger, ftString, ftString]);
+  Result := Trim(TParametrosRepository.ObterValor(0, aArgumento, aSubArgumento, LAdicional));
   if Result = '' then
-   Result := aDefault;
+    Result := aDefault;
 end;
 
 
 function RetornaParamComEmp(aCod_emp :Integer; aArgumento :string; aSubArgumento :String; aDefault:string): string;
+var
+  LAdicional: string;
 begin
-  Result := DM.RetornaStringTabela(
-               'select Trim(A.PARAMETRO) ' +
-               'from PARAMETROS2 A ' +
-               'where (A.COD_EMP = :COD_EMP) ' +
-               'and (A.ARGUMENTO = :ARGUMENTO) ' +
-               'and (A.SUBARGUM = :SUBARGUM) ',
-               [aCod_emp, aArgumento, aSubArgumento],
-               [ftInteger, ftString, ftString]);
+  Result := Trim(TParametrosRepository.ObterValor(aCod_emp, aArgumento, aSubArgumento, LAdicional));
   if Result = '' then
-   Result := aDefault;
+    Result := aDefault;
 end;
 
 { TAlignEditP }
@@ -244,156 +529,88 @@ end;
 
 
 { TParametros2 }
-constructor TParametros2.Create(AArgumento :string; ASubArgumento :string;
-      AParametroAdicional :string;AdescrParametro :string);
+constructor TParametros2.Create(AArgumento: string; ASubArgumento: string;
+  AParametroAdicional: string; AdescrParametro: string; ACodEmp: Integer);
 begin
-
   Argumento := AArgumento;
   Subargumento := ASubArgumento;
-  ParametroAdicional :=AParametroAdicional;
+  ParametroAdicional := AParametroAdicional;
   DescrParametro := AdescrParametro;
+  FCodEmp := ResolveCodEmp(ACodEmp);
   OpcaoLista := opNaoAdicionarPalavraTodos;
 end;
 
 destructor TParametros2.Destroy;
 begin
   inherited;
-
 end;
 
-function TParametros2.GetParametro2:string;
-var
-  FITems :TStringList;
-  sFiltro :string;
+class function TParametros2.ResolveCodEmp(const ACodEmp: Integer): Integer;
 begin
-  if not DM.QParametros2.Active then
-    DM.QParametros2.Open;
-  DM.QParametros2.Filtered := False;
-  if iEmp = 0 then
-   iEmp := iemp;
-  sFiltro := ' COD_EMP = ' + IntToStr(iEmp) +
-    ' and ARGUMENTO = ' + QuotedStr(Self.Argumento);
-  if Self.SubArgumento <> '' then
-  begin
-    sFiltro := sFiltro + ' and SUBARGUM = ' + QuotedStr(Self.Subargumento);
-    DM.QParametros2.Filter := sFiltro;
-    DM.QParametros2.Filtered := True;
-    Result := DM.QParametros2PARAMETRO.AsString;
-    ParametroAdicional := DM.QParametros2PARAMETRO2.AsString;
-  end
+  if ACodEmp >= 0 then
+    Exit(ACodEmp);
+  Result := iEmp;
+  if Result = 0 then
+    Result := iemp;
+end;
+
+class function TParametros2.DefaultCodEmp: Integer;
+begin
+  Result := ResolveCodEmp(-1);
+end;
+
+function TParametros2.IsLista: Boolean;
+begin
+  Result := Subargumento = '';
+end;
+
+function TParametros2.GetParametro2: string;
+var
+  LAdicional: string;
+begin
+  if IsLista then
+    Result := TParametrosRepository.ObterLista(FCodEmp, Argumento, OpcaoLista = opAdicionarPalavraTodos)
   else
   begin
-    DM.QParametros2.Filter := sFiltro;
-    DM.QParametros2.Filtered := True;
-    DM.QParametros2.First;
-    FITems := TStringList.Create;
-    if OpcaoLista = opAdicionarPalavraTodos then
-    FITems.Add('TODOS');
-    try
-      while not DM.QParametros2.Eof do
-      begin
-        FITems.Add(DM.QParametros2PARAMETRO.AsString);
-        DM.QParametros2.Next;
-      end;
-      Result := FITems.Text;
-    finally
-      FITems.Free;
-    end;
+    Result := TParametrosRepository.ObterValor(FCodEmp, Argumento, Subargumento, LAdicional);
+    ParametroAdicional := LAdicional;
   end;
-  DM.QParametros2.Filtered := False;
-end;
-
-procedure TParametros2.InserirParametroNoBanco;
-begin
-  DM.QInsParam2.Close;
-  DM.QInsParam2.SQL.Clear;
-  DM.QInsParam2.SQL.Add('update or insert into PARAMETROS2 (COD_EMP, ARGUMENTO, SUBARGUM, PARAMETRO, DESCRPAR, PARAMETRO2) ');
-  DM.QInsParam2.SQL.Add('values (:COD_EMP, :ARGUMENTO, :SUBARGUM, :PARAMETRO, :DESCRPAR, :PARAMETRO2) ');
-  DM.QInsParam2.SQL.Add('matching (COD_EMP, ARGUMENTO, SUBARGUM) ');
-
-  DM.QInsParam2.ParamByName('COD_EMP').AsInteger := iEmp;
-  DM.QInsParam2.ParamByName('ARGUMENTO').AsString := Self.Argumento;
-  DM.QInsParam2.ParamByName('SUBARGUM').AsString := Self.Subargumento;
-  DM.QInsParam2.ParamByName('PARAMETRO').AsString := FParametro2;
-  DM.QInsParam2.ParamByName('PARAMETRO2').AsString := Self.ParametroAdicional;
-  DM.QInsParam2.ParamByName('DESCRPAR').AsString := Self.DescrParametro;
-  try
-    DM.QInsParam2.ExecSQL;
-   except on e: Exception do
-     raise Exception.Create('Erro ao inserir parametro' +
-               'Argumento:'    + Self.Argumento + sLineBreak +
-               'SubArgumento:' + Self.Argumento + sLineBreak +
-               'Parametro:'    + Self.Argumento + sLineBreak +
-               e.Message);
-  end;
-
-end;
-
-class function TParametros2.RetornaParametroDef(FArgumento, FSubArgumento,
-  FDefault: string): string;
-var
-  FParametros :TParametros2;
-begin
-  FParametros := TParametros2.Create(FArgumento, FSubArgumento);
-  try
-    Result := FParametros.Parametro2;
-    if Result = '' then
-    Result := FDefault;
-  finally
-    FParametros.Free;
-  end;
+  FParametro2 := Result;
 end;
 
 class function TParametros2.RetornaParametro(FArgumento,
   FSubArgumento: string): string;
 var
-  FParametros :TParametros2;
+  LAdicional: string;
 begin
-  FParametros := TParametros2.Create(FArgumento, FSubArgumento);
-  try
-    Result := FParametros.Parametro2;
-  finally
-    FParametros.Free;
-  end;
+  Result := TParametrosRepository.ObterValor(DefaultCodEmp, FArgumento, FSubArgumento, LAdicional);
+end;
+
+class function TParametros2.RetornaParametroDef(FArgumento, FSubArgumento,
+  FDefault: string): string;
+begin
+  Result := RetornaParametro(FArgumento, FSubArgumento);
+  if Result = '' then
+    Result := FDefault;
 end;
 
 procedure TParametros2.SetParametro2(const Value: string);
-var FItems :TStringList;
-  I:Integer;
-  sFiltro, sParam :string;
-
+var
+  LItens: TStringList;
 begin
   FParametro2 := Value;
-  if not DM.QParametros2.Active then
-    DM.QParametros2.Open;
-  DM.QParametros2.Filtered := False;
-  sFiltro := ' COD_EMP = ' + IntToStr(iEmp) + ' and ARGUMENTO = ' + QuotedStr(Self.Argumento);
-  if Self.SubArgumento <> '' then
+  if IsLista then
   begin
-    sFiltro := sFiltro + ' and SUBARGUM = ' + QuotedStr(Self.Subargumento);
-    DM.QParametros2.Filter := sFiltro;
-    DM.QParametros2.Filtered := True;
-    if (Self.FParametro2 <> DM.QParametros2PARAMETRO.AsString) or
-       (Self.ParametroAdicional <> DM.QParametros2PARAMETRO2.AsString) then
-      InserirParametroNoBanco;
+    LItens := TStringList.Create;
+    try
+      LItens.Text := Value;
+      TParametrosRepository.GravarLista(FCodEmp, Argumento, LItens);
+    finally
+      LItens.Free;
+    end;
   end
   else
-  begin
-    FItems := TStringList.Create;
-    DM.ExecutaSQL('DELETE FROM PARAMETROS2 WHERE  COD_EMP = ' + IntToStr(iEmp)
-      + ' AND ARGUMENTO = ' + QuotedStr(Self.Argumento));
-    try
-      FItems.Text := Value;
-      for I := 0 to FItems.Count - 1 do
-      begin
-        FParametro2 := FItems[I];
-        Subargumento := IntToStr(I);
-        InserirParametroNoBanco;
-      end;
-    finally
-      FItems.Free;
-    end;
-  end;
+    TParametrosRepository.GravarValor(FCodEmp, Argumento, Subargumento, Value, ParametroAdicional, DescrParametro);
 end;
 
 { TEditP }
